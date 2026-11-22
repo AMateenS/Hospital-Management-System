@@ -1,0 +1,53 @@
+# Round 4: Doctor, Pharmacy & Laboratory enhancements
+
+**Read this first.** Run `npm run migrate` in `backend/` once after updating (safe to repeat), then restart the backend. No new npm packages were added.
+The system was changed in place; nothing was rebuilt and no collection or record is deleted. The sandbox this was written in has no database or network, so **the workflows were not executed end to end**; see section 7 for exactly what was and was not verified.
+
+## 1. The reported problems and what was found
+
+| # | Report | Finding |
+|---|--------|---------|
+| 1 | "Visit Not Found" on Doctor Dashboard → View Details | **Could not reproduce by code inspection.** The dashboard row, the link (`/doctor/visit/<visitId>`) and the API (`GET /api/doctor/visits/:id`) all use the same visit `_id`, and the API only returns "Visit not found" when the id matches no visit. Likely triggers: an outdated link or bookmark, a link carrying a *patient* id instead of a visit id, or a visit that was removed. See 2.1 for the defensive fix. If you still get the error after this update, send me the browser URL and the exact message. |
+| 2 | Prescription writing template | Existed, but: the prescription number only appeared after final confirmation, "additional advice" and "doctor notes" were not in the default templates, and previous prescriptions / lab reports were not shown in the patient's history. |
+| 3 | Doctor prescription → Pharmacy | A prescription reached the pharmacy only when the consultation was finished. There was no "send without finishing", no Partially Dispensed status, no per-medicine availability, one-shot dispensing only, and no way to return a prescription to the doctor. |
+| 4 | "Pharmacist management is not working" | **There was no pharmacist management on the Pharmacy dashboard.** Pharmacist accounts could only be created through the generic Users page. It is now a proper admin-only module. |
+| 5 | Laboratory ordering | Orders had no priority, clinical indication, category or cancel; statuses did not match your list; the same test could be ordered twice by a double click. |
+
+## 2. How each was addressed
+**2.1 View Details.** The visit lookup now accepts a visit id, a **visit number** (`V-000123`) or a **patient id** (opens that patient's latest visit with this doctor), returns `400 Invalid visit link` for malformed ids, and a clear `404` message otherwise. Ownership is still enforced (`403` for another doctor's patient). The page redirects to the canonical visit URL. The record now also shows: patient/contact details, assigned doctor, visit info, history, previous diagnoses, **previous prescriptions** and **laboratory reports** (all from the database).
+**2.2 Prescription.** The doctor's page is the prescription template (header with hospital and doctor, patient band, vitals from reception, template fields incl. symptoms/observations, medicines, additional advice, doctor notes, follow-up, signature). A **Prescription No. is assigned on first save** and stored in MongoDB against patient, doctor and visit. Buttons: *Save draft*, *Save & send to pharmacy*, *Finish consultation* (also marks the patient Completed at reception), *Print / PDF*, *Amend record* (reason required; previous version kept).
+**2.3 Pharmacy link.** *Save draft* keeps the prescription private (status `Draft`; the pharmacy cannot see it). *Save & send to pharmacy* releases it as `Pending` **without** finishing the consultation; *Finish consultation* also sends it. Re-sending the same prescription never creates a duplicate (database-level unique rule: one open prescription per visit).
+**2.4 Pharmacy processing.** "Patient prescriptions" list (Rx no., patient, patient ID, doctor, date, visit ID, status) → View Details shows the doctor's actual prescription **read-only** (diagnosis, medicines, dosage, frequency, duration, instructions, advice, notes). Per medicine the pharmacist chooses: dispense now (stock item + quantity ≤ remaining), mark available, mark unavailable, or decide later. Statuses: Pending, **Partially Dispensed**, Dispensed, Returned. Every dispensing event is stored as a **DispensingRecord** (pharmacist, date, batch, quantity, price, total) and stock is deducted atomically (rolled back on failure; short lock prevents double dispensing). Print prescription, print dispensing receipt (all events). **Return to doctor** (reason required, only while nothing is dispensed): the doctor sees it on the dashboard and on the patient page, corrects and re-sends.
+**2.5 Pharmacist management (admin only, enforced by the API).** Add, view (with dispensing history), edit, search/filter, activate/deactivate, reset password (signs out their sessions), delete (blocked if the pharmacist has dispensing history; deactivate instead). Fields validated on both client and server; success/error notifications. **Permissions** per pharmacist: dispense, manage inventory, return to doctor, view receipts (accounts created before this keep full access).
+**2.6 Laboratory.** Doctor order form: patient, visit ID, doctor, order date/time, **category**, test names (multi-select + custom), **clinical indication (required)**, **priority** Routine/Urgent/Emergency, instructions. Statuses: Pending, Accepted, Sample Collected, **Processing**, Completed, **Cancelled**. The doctor sees live status on the page and on a "Laboratory tests" dashboard section; may cancel Pending orders. The lab sees emergency/urgent first, can enter results, upload a report file, confirm completion, or cancel with a reason. Completed results show in the doctor's page and in the patient's history. Repeat submissions of a test that is already open for the visit are rejected.
+
+## 3. New features (summary)
+Tolerant visit links · patient history (previous prescriptions, lab reports) · Rx number at first save · Draft / send-to-pharmacy · returned-prescription loop · partial dispensing and per-medicine availability · dispensing records and cumulative receipt · pharmacist module with permissions · lab priority/indication/category/cancel · duplicate protection · toast notifications · migration script · default template fields.
+
+## 4. Files
+**New (backend):** `models/DispensingRecord.js`, `routes/pharmacists.js`, `utils/rxStatus.js`, `utils/rxDetails.js`, `utils/rxIssue.js`, `utils/permissions.js`, `utils/defaultFields.js`, `migrate.js`, `test/unit/rx.test.js`.
+**Modified (backend):** `models/Prescription.js`, `models/LabRequest.js`, `models/User.js`, `routes/doctor.js`, `routes/lab.js`, `routes/pharmacy.js` (rewritten), `routes/prescriptions.js`, `routes/admin.js`, `routes/reports.js`, `utils/revenue.js`, `app.js`, `seed.js`, `package.json` (script `migrate`), `test/integration/workflow.test.js`.
+**New (frontend):** `context/ToastContext.js`, `lib/labTests.js`, `components/pharmacy/PharmacistsTab.js`.
+**Modified (frontend):** `app/layout.js`, `app/(app)/doctor/visit/[id]/page.js`, `app/(app)/doctor/page.js`, `app/(app)/laboratory/page.js`, `app/(app)/laboratory/request/[id]/page.js`, `app/(app)/pharmacy/page.js`, `components/doctor/LabRequestPanel.js` (rewritten), `components/pharmacy/PrescriptionsTab.js` (rewritten), `components/ui/index.js`, `lib/labCatalog.js`.
+
+## 5. MongoDB schema changes (additive; no field or collection removed)
+* **Prescription:** + `diagnosis`, `details[{label,value}]`, `issuedAt`, `isOpen`, `lockedAt`, `returnReason/returnedBy/returnedAt`; `status` adds `Draft`, `Partially Dispensed`, `Returned`; item adds `availability`; **partial unique index** `{visit}` where `isOpen: true`.
+* **DispensingRecord (new):** prescription, visit, patient, pharmacist, lines[], total, dispensedAt.
+* **LabRequest:** + `priority`, `indication`, `instructions`, `cancelReason/cancelledAt/cancelledBy`, per-test `category`; `status` renames `In Progress` → `Processing`, adds `Cancelled`.
+* **User:** + `licenseNo`, `employeeId`, `permissions` (pharmacy).
+* Existing templates gain "Symptoms & observations", "Additional medical advice" and "Doctor notes" fields as a **new template version** via `npm run migrate` (old versions are kept).
+* There is no separate Appointment collection: a **Visit is the appointment** (registration → consultation) throughout the system.
+
+## 6. API
+**New:** `POST /api/doctor/visits/:id/send-prescription` · `POST /api/doctor/visits/:id/lab-requests/:labId/cancel` · `POST /api/lab/requests/:id/cancel` · `POST /api/pharmacy/prescriptions/:id/return` · `GET|POST /api/pharmacists`, `GET|PUT|DELETE /api/pharmacists/:id`, `PATCH /:id/active`, `POST /:id/reset-password` (admin only).
+**Changed:** `GET /api/doctor/visits/:id` (+history, tolerant id) · `GET /api/doctor/overview` (+labOrders, returned) · `PUT …/consultation` (keeps a Draft prescription) · `POST …/lab-requests` (new body: tests, indication, priority, instructions; duplicate guard) · `POST /api/pharmacy/prescriptions/:id/dispense` (body `{lines:[{itemId, action: dispense|available|unavailable, medicineId, quantity}]}` → `{prescription, record}`) · `GET /api/pharmacy/prescriptions[/:id]` (drafts hidden, diagnosis/details/records) · `GET …/receipt` (all dispensing events) · `GET /api/prescriptions/sheet/:visitId` (pharmacy can print what was sent) · reports/revenue now count pharmacy revenue from dispensing records.
+
+## 7. Verification: honest status
+**Run and passing here:** 11 unit tests (prescription status logic, pharmacist permissions, detail extraction, plus the earlier security/CSV/file-check tests); syntax check of every backend file; bracket-balance check of every edited frontend file; the template migration helper on sample data.
+**Written but NOT run** (needs MongoDB and `supertest`): the integration tests in `backend/test/integration/workflow.test.js` now cover Workflow A (doctor prescription, tolerant visit link), B (pharmacy: actual prescription shown, partial and full dispensing, stock, return to doctor, permissions), C (pharmacist management incl. deactivation and delete rules) and D (lab order → results → doctor, priority, cancel, duplicates). **The frontend was not opened in a browser.** Use `TEST_CHECKLIST.md` section J (Workflows A–D) and tell me what fails.
+
+## 8. Manual steps
+1. `cd backend && npm run migrate` (renames lab statuses, marks open prescriptions, upgrades templates, builds the new index). Restart the backend.
+2. Existing pharmacist accounts keep full permissions until you edit them (Pharmacy → Pharmacists).
+3. If MongoDB Atlas refuses the unique index (very old duplicate open prescriptions for one visit), send me the error.
+4. Browser: hard-refresh once (Ctrl+Shift+R) so the new frontend is loaded; an old tab with an old link is a likely source of "Visit not found".
